@@ -16,15 +16,10 @@ const CONFIG = {
   subCategoryText: "Permanent residence permit",
   officesInPriorityOrder: [
     "Helsinki",
-    "Espoo",
-    "Vantaa",
     "Turku",
     "Tampere",
     "Lahti",
-    "Lappeenranta",
-    "Kuopio",
-    "Oulu",
-    "Rovaniemi",
+    "Lappeenranta"
   ],
 
   // Date window: open appointment slots from 1 week through 3 weeks from today.
@@ -69,6 +64,7 @@ const CONFIG = {
 
 const HEADLESS = process.env.HEADLESS !== "false";
 const SLOW_MO_MS = Number(process.env.SLOW_MO_MS ?? 0);
+const DRY_RUN = process.env.DRY_RUN === "true";
 
 function startOfLocalDay(date = new Date()) {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate());
@@ -261,9 +257,15 @@ async function findSlotsForOffice(page, office, minDate, maxDate) {
 
 async function sendEmail({ office, slots }) {
   const { GMAIL_USER, GMAIL_APP_PASSWORD, ALERT_TO_EMAIL } = process.env;
+
+  if (DRY_RUN) {
+    console.log(`[${office}] Dry run enabled. Would send an email with ${slots.length} slot(s).`);
+    return;
+  }
+
   if (!GMAIL_USER || !GMAIL_APP_PASSWORD || !ALERT_TO_EMAIL) {
     throw new Error(
-      "Missing email environment variables. Set GMAIL_USER, GMAIL_APP_PASSWORD, and ALERT_TO_EMAIL.",
+      "Missing email environment variables. Set GMAIL_USER, GMAIL_APP_PASSWORD, and ALERT_TO_EMAIL, or run with DRY_RUN=true.",
     );
   }
 

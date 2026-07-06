@@ -70,6 +70,14 @@ $env:HEADLESS="false"
 npm run check
 ```
 
+To test the flow without sending an email, run in dry-run mode:
+
+```powershell
+$env:DRY_RUN="true"
+$env:HEADLESS="false"
+npm run check
+```
+
 No email is sent when no matching slot is found.
 
 ## GitHub Actions Setup
