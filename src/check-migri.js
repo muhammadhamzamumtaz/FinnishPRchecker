@@ -1,70 +1,31 @@
 import { chromium } from "playwright";
 import nodemailer from "nodemailer";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 
-/**
- * MIGRI APPOINTMENT CHECKER CONFIGURATION
- *
- * The Migri booking site is an Angular single-page app. Its labels, roles, and
- * calendar markup can change without notice, so treat this section as the first
- * place to adjust after a headed calibration run.
- */
 const CONFIG = {
   bookingUrl: "https://migri.vihta.com/public/migri/#/reservation",
-
-  // Booking flow labels. Adjust these if the UI text differs on first run.
-  categoryText: "Residence permit",
-  subCategoryText: "Permanent residence permit",
-  officesInPriorityOrder: [
-    "Helsinki",
-    "Turku",
-    "Tampere",
-    "Lahti",
-    "Lappeenranta"
+  targetOffices: [
+    { name: "Tampere", optionPattern: /Tampere : Tampereen palvelupiste/i },
+    { name: "Helsinki", optionPattern: /Helsinki : Helsingin palvelupiste/i },
+    { name: "Lahti", optionPattern: /Lahti : Lahden palvelupiste/i },
+    { name: "Lappeenranta", optionPattern: /Lappeenranta : Lappeenrannan palvelupiste/i },
+    { name: "Turku", optionPattern: /Turku : Raision palvelupiste/i },
   ],
-
-  // Date window: open appointment slots from 1 week through 3 weeks from today.
-  minDaysFromToday: 7,
-  maxDaysFromToday: 21,
-
-  /**
-   * Calendar detection settings.
-   *
-   * These are deliberately centralized because the live site's exact DOM must be
-   * confirmed with Playwright in headed mode. The default logic tries accessible
-   * buttons/links first, then common calendar/time-slot CSS class names.
-   */
-  calendar: {
-    nextMonthButtonNames: [/next/i, /seuraava/i],
-    candidateSlotSelector:
-      [
-        "button:not([disabled])",
-        "a[href]",
-        "[role='button']:not([aria-disabled='true'])",
-        ".available",
-        ".free",
-        ".open",
-        ".time-slot",
-        ".timeslot",
-        ".appointment",
-      ].join(", "),
-    unavailableTextPatterns: [
-      /no appointments/i,
-      /not available/i,
-      /fully booked/i,
-      /ei vapaita/i,
-      /ei aikoja/i,
-      /varattu/i,
-    ],
-  },
-
-  // Local troubleshooting helpers.
-  debugScreenshots: process.env.DEBUG_SCREENSHOTS === "true",
-  debugScreenshotDir: "debug-screenshots",
+  categoryTextPatterns: [/o?leskelulupa/i],
+  serviceTextPatterns: [/pysyv/i],
+  applicantTextPatterns: [/1\s*(henkilo|person)/i],
+  searchButtonTextPatterns: [/hae\s+vapaat\s+ajat|search/i],
+  weekTabPattern: /vk\s*\d+/i,
+  maxLookaheadDays: 60,
+  debugDir: "debug-output",
 };
 
 const HEADLESS = process.env.HEADLESS !== "false";
+const LOOKAHEAD_DAYS = Number(process.env.LOOKAHEAD_DAYS ?? CONFIG.maxLookaheadDays);
 const SLOW_MO_MS = Number(process.env.SLOW_MO_MS ?? 0);
 const DRY_RUN = process.env.DRY_RUN === "true";
+const SEEN_SLOTS = new Set();
 
 function startOfLocalDay(date = new Date()) {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate());
@@ -84,255 +45,349 @@ function formatDate(date) {
   }).format(date);
 }
 
+function parseDate(text, fallbackYear) {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  const iso = normalized.match(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/);
+  if (iso) return new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+
+  const dotted = normalized.match(/\b(\d{1,2})\.(\d{1,2})\.(20\d{2})?\b/);
+  if (dotted) {
+    return new Date(Number(dotted[3] || fallbackYear), Number(dotted[2]) - 1, Number(dotted[1]));
+  }
+
+  const slash = normalized.match(/\b(\d{1,2})\/(\d{1,2})\/(20\d{2})?\b/);
+  if (slash) {
+    return new Date(Number(slash[3] || fallbackYear), Number(slash[2]) - 1, Number(slash[1]));
+  }
+
+  return null;
+}
+
+function toIsoDate(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 function isWithinWindow(date, minDate, maxDate) {
   const day = startOfLocalDay(date);
   return day >= minDate && day <= maxDate;
 }
 
-async function clickByText(page, label, description) {
-  const exactRoleLocator = page
-    .getByRole("button", { name: label, exact: true })
-    .or(page.getByRole("link", { name: label, exact: true }))
-    .or(page.getByRole("option", { name: label, exact: true }));
-
-  if (await exactRoleLocator.first().isVisible().catch(() => false)) {
-    await exactRoleLocator.first().click();
-    return;
-  }
-
-  const textLocator = page.getByText(label, { exact: true });
-  if (await textLocator.first().isVisible().catch(() => false)) {
-    await textLocator.first().click();
-    return;
-  }
-
-  throw new Error(
-    `Could not find ${description} with text "${label}". Run HEADLESS=false and adjust CONFIG labels/selectors.`,
-  );
+async function ensureDebugDir() {
+  await mkdir(CONFIG.debugDir, { recursive: true });
 }
 
-async function maybeClickByText(page, label) {
-  const locator = page
-    .getByRole("button", { name: label, exact: true })
-    .or(page.getByRole("link", { name: label, exact: true }))
-    .or(page.getByText(label, { exact: true }));
+async function dumpDiagnostics(page, label) {
+  await ensureDebugDir();
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const screenshotPath = path.join(CONFIG.debugDir, `${ts}-${label}.png`);
+  const htmlPath = path.join(CONFIG.debugDir, `${ts}-${label}.html`);
+  const optionsPath = path.join(CONFIG.debugDir, `${ts}-${label}.json`);
 
-  if (await locator.first().isVisible().catch(() => false)) {
-    await locator.first().click();
-    return true;
+  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+  const html = await page.content().catch(() => "");
+  const options = await page.evaluate(() => Array.from(document.querySelectorAll("button, a, li, [role='option']"))
+    .map((element) => (element.textContent || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean));
+
+  await writeFile(htmlPath, html, "utf8").catch(() => {});
+  await writeFile(optionsPath, JSON.stringify(options.slice(0, 250), null, 2), "utf8").catch(() => {});
+  console.log(`[DEBUG] Wrote diagnostics to ${CONFIG.debugDir}`);
+}
+
+async function clickMatchingOption(page, patterns, description) {
+  console.log(`[INFO] Selecting ${description}`);
+  for (const pattern of patterns) {
+    const locator = page.locator("li[role='option'], [role='option']").filter({ hasText: pattern }).first();
+    if (await locator.count()) {
+      const text = ((await locator.textContent().catch(() => "")) || "").replace(/\s+/g, " ").trim();
+      console.log(`[INFO] Found ${description} option: ${text}`);
+      await locator.scrollIntoViewIfNeeded().catch(() => {});
+      await locator.evaluate((element) => {
+        element.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      });
+      await page.waitForTimeout(1_000);
+      return text;
+    }
   }
-  return false;
+
+  for (const pattern of patterns) {
+    const fallback = page.locator("button, a").filter({ hasText: pattern }).first();
+    if (await fallback.count()) {
+      const text = ((await fallback.textContent().catch(() => "")) || "").replace(/\s+/g, " ").trim();
+      console.log(`[INFO] Found ${description} fallback option: ${text}`);
+      await fallback.evaluate((element) => {
+        element.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      });
+      await page.waitForTimeout(1_000);
+      return text;
+    }
+  }
+
+  return null;
+}
+
+async function openDropdownAndPick(page, buttonTextPattern, optionTextPatterns, description) {
+  const trigger = page.locator("button, [role='button']").filter({ hasText: buttonTextPattern }).first();
+  if (await trigger.count()) {
+    await trigger.click();
+    await page.waitForTimeout(1_000);
+  }
+
+  const selectedText = await clickMatchingOption(page, optionTextPatterns, description);
+  if (!selectedText) {
+    await dumpDiagnostics(page, description.replace(/\s+/g, "-").toLowerCase());
+    throw new Error(`Could not find ${description}`);
+  }
+  return selectedText;
+}
+
+async function waitForSearchButton(page) {
+  const button = page.locator("button, [role='button']").filter({ hasText: CONFIG.searchButtonTextPatterns[0] }).first();
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const visible = await button.isVisible().catch(() => false);
+    const enabled = await button.isEnabled().catch(() => false);
+    if (visible && enabled) {
+      return button;
+    }
+    await page.waitForTimeout(750);
+  }
+  return button;
 }
 
 async function selectBookingFlow(page, office) {
+  console.log("[INFO] Opening Migri page");
   await page.goto(CONFIG.bookingUrl, { waitUntil: "domcontentloaded" });
   await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
 
-  await clickByText(page, CONFIG.categoryText, "category");
-  await page.waitForTimeout(800);
+  await openDropdownAndPick(page, /palvelukategoria/i, CONFIG.categoryTextPatterns, "service category");
+  await openDropdownAndPick(page, /palvelu/i, CONFIG.serviceTextPatterns, "service");
+  const applicantOption = page.locator("button, a, li, [role='option']").filter({ hasText: CONFIG.applicantTextPatterns[0] }).first();
+  if (await applicantOption.count()) {
+    const applicantText = ((await applicantOption.textContent().catch(() => "")) || "").replace(/\s+/g, " ").trim();
+    console.log(`[INFO] Found applicant count option: ${applicantText}`);
+    await applicantOption.click({ force: true });
+    await page.waitForTimeout(1_000);
+  } else {
+    console.log("[INFO] Applicant count control not present; continuing with the next step.");
+  }
 
-  await clickByText(page, CONFIG.subCategoryText, "sub-category");
-  await page.waitForTimeout(800);
+  const officeText = await openDropdownAndPick(page, /toimipiste/i, [office.optionPattern], `service point (${office.name})`);
+  office.selectedText = officeText;
 
-  await clickByText(page, office, "office/location");
-  await page.waitForTimeout(1_500);
+  const dayViewToggle = page.locator("button, [role='button'], label, input").filter({ hasText: /näytä vapaat ajat päivä kerrallaan|view available times by day/i }).first();
+  if (await dayViewToggle.count()) {
+    console.log("[INFO] Enabling day view for available times");
+    await dayViewToggle.evaluate((element) => {
+      if (element instanceof HTMLInputElement) {
+        element.checked = true;
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+      } else {
+        element.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      }
+    });
+    await page.waitForTimeout(2_000);
+  }
 
-  // Some Vihta flows have an explicit continue/search step after choices.
-  for (const label of ["Search", "Continue", "Next", "Hae", "Jatka", "Seuraava"]) {
-    if (await maybeClickByText(page, label)) {
-      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
-      await page.waitForTimeout(1_500);
-      break;
+  const searchButton = await waitForSearchButton(page);
+  console.log(`[INFO] Searching appointments for ${office.name}`);
+  if (await searchButton.count()) {
+    await searchButton.click({ force: true });
+  } else {
+    await page.evaluate(() => {
+      const button = Array.from(document.querySelectorAll("button")).find((element) => /hae\s+vapaat\s+ajat|search/i.test(element.textContent || ""));
+      if (button) {
+        button.click();
+      }
+    });
+  }
+  await page.waitForTimeout(4_000);
+}
+
+async function extractSlotsFromCurrentWeek(page, office, minDate, maxDate) {
+  const slots = [];
+
+  const pageState = await page.evaluate(() => {
+    const buttons = Array.from(document.querySelectorAll("button"));
+    const dayButton = buttons.find((button) => {
+      const text = (button.textContent || "").replace(/\s+/g, " ").trim();
+      return /^(ma|ti|ke|to|pe|la|su)\s+\d{1,2}\.\d{1,2}\.?$/i.test(text) && (button.getAttribute("aria-pressed") === "true" || button.classList.contains("active"));
+    });
+
+    const headingDate = Array.from(document.querySelectorAll("h1, h2, h3, h4, div, span, p, button"))
+      .map((element) => (element.textContent || "").replace(/\s+/g, " ").trim())
+      .find((text) => /vapaat ajat/i.test(text) && /\d{1,2}\.\d{1,2}\.\d{4}/.test(text));
+
+    const slotButtons = buttons.map((button) => ({
+      text: (button.textContent || "").replace(/\s+/g, " ").trim(),
+      aria: button.getAttribute("aria-label") || "",
+      title: button.getAttribute("title") || "",
+    })).filter(({ text, aria, title }) => {
+      const combined = `${text} ${aria} ${title}`;
+      return /^\d{1,2}\.\d{2}$/.test(text) || (/\d{1,2}\.\d{2}/.test(combined) && /kello/i.test(combined));
+    });
+
+    return { dayButtonText: dayButton ? (dayButton.textContent || "").replace(/\s+/g, " ").trim() : null, headingDate, slotButtons };
+  });
+
+  const selectedDate = (() => {
+    const headingMatch = pageState.headingDate?.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+    if (headingMatch) {
+      return parseDate(`${headingMatch[1]}.${headingMatch[2]}.${headingMatch[3]}`, new Date().getFullYear());
+    }
+
+    const dayMatch = pageState.dayButtonText?.match(/(\d{1,2})\.(\d{1,2})\.?/);
+    if (dayMatch) {
+      return parseDate(`${dayMatch[1]}.${dayMatch[2]}.${new Date().getFullYear()}`, new Date().getFullYear());
+    }
+
+    return null;
+  })();
+
+  if (selectedDate && isWithinWindow(selectedDate, minDate, maxDate)) {
+    const iso = toIsoDate(selectedDate);
+    for (const slotButton of pageState.slotButtons) {
+      const timeMatch = slotButton.text.match(/^(\d{1,2}\.\d{2})$/);
+      const time = timeMatch ? timeMatch[1] : null;
+      if (!time) continue;
+
+      const key = `${office.name}:${iso}:${time}`;
+      if (SEEN_SLOTS.has(key)) continue;
+      SEEN_SLOTS.add(key);
+
+      slots.push({ office: office.name, location: office.selectedText || office.name, date: iso, time, source: `${pageState.headingDate || ""} ${slotButton.text}` });
     }
   }
-}
 
-async function readCandidateSlots(page, minDate, maxDate) {
-  const yearHint = new Date().getFullYear();
+  const rows = await page.locator("button, [role='button'], a").evaluateAll((elements) => elements.map((element) => ({
+    text: (element.textContent || "").replace(/\s+/g, " ").trim(),
+    aria: element.getAttribute("aria-label") || "",
+    title: element.getAttribute("title") || "",
+  })));
 
-  return page.locator(CONFIG.calendar.candidateSlotSelector).evaluateAll(
-    (elements, args) => {
-      const { yearHint: browserYearHint, minTime, maxTime } = args;
+  for (const row of rows) {
+    const combined = `${row.text} ${row.aria} ${row.title}`;
+    if (!/\d{1,2}:\d{2}/.test(combined)) continue;
+    const timeMatch = combined.match(/(\d{1,2}:\d{2})/);
+    const time = timeMatch ? timeMatch[1] : null;
+    const dateMatch = combined.match(/\b(\d{1,2})\.(\d{1,2})\.(20\d{2})?\b/);
+    if (!dateMatch || !time) continue;
 
-      function parseDate(text) {
-        const normalized = text.replace(/\s+/g, " ").trim();
-        const iso = normalized.match(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/);
-        if (iso) return new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+    const date = parseDate(`${dateMatch[1]}.${dateMatch[2]}.${dateMatch[3] || new Date().getFullYear()}`, new Date().getFullYear());
+    if (!date || !isWithinWindow(date, minDate, maxDate)) continue;
 
-        const dotted = normalized.match(/\b(\d{1,2})\.(\d{1,2})\.(20\d{2})?\b/);
-        if (dotted) {
-          return new Date(
-            Number(dotted[3] || browserYearHint),
-            Number(dotted[2]) - 1,
-            Number(dotted[1]),
-          );
-        }
+    const iso = toIsoDate(date);
+    const key = `${office}:${iso}:${time}`;
+    if (SEEN_SLOTS.has(key)) continue;
+    SEEN_SLOTS.add(key);
 
-        const slash = normalized.match(/\b(\d{1,2})\/(\d{1,2})\/(20\d{2})?\b/);
-        if (slash) {
-          return new Date(
-            Number(slash[3] || browserYearHint),
-            Number(slash[2]) - 1,
-            Number(slash[1]),
-          );
-        }
+    slots.push({ office, date: iso, time, source: combined });
+  }
 
-        return null;
-      }
-
-      function toLocalIsoDate(date) {
-        const year = date.getFullYear();
-        const month = String(date.getMonth() + 1).padStart(2, "0");
-        const day = String(date.getDate()).padStart(2, "0");
-        return `${year}-${month}-${day}`;
-      }
-
-      return elements
-        .map((element) => {
-          const aria = element.getAttribute("aria-label") || "";
-          const title = element.getAttribute("title") || "";
-          const datetime = element.getAttribute("datetime") || "";
-          const dataDate = element.getAttribute("data-date") || "";
-          const text = element.textContent || "";
-          const combined = [aria, title, datetime, dataDate, text].filter(Boolean).join(" ");
-          const date = parseDate(combined);
-
-          if (!date || date.getTime() < minTime || date.getTime() > maxTime) return null;
-
-          return {
-            dateIso: toLocalIsoDate(date),
-            label: combined.replace(/\s+/g, " ").trim(),
-          };
-        })
-        .filter(Boolean);
-    },
-    {
-      yearHint,
-      minTime: minDate.getTime(),
-      maxTime: maxDate.getTime(),
-    },
-  );
-}
-
-async function goToNextCalendarPage(page) {
-  for (const name of CONFIG.calendar.nextMonthButtonNames) {
-    const button = page.getByRole("button", { name });
-    if (await button.first().isVisible().catch(() => false)) {
-      await button.first().click();
-      await page.waitForTimeout(1_500);
-      return true;
+  const nextAvailableText = await page.locator("body").innerText().catch(() => "");
+  const nextMatch = nextAvailableText.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+  if (nextMatch) {
+    const candidateDate = parseDate(`${nextMatch[1]}.${nextMatch[2]}.${nextMatch[3]}`, new Date().getFullYear());
+    if (candidateDate && isWithinWindow(candidateDate, minDate, maxDate)) {
+      const availableDate = toIsoDate(candidateDate);
+      slots.push({ office, date: availableDate, time: "next available", source: nextAvailableText.slice(0, 200) });
     }
   }
-  return false;
+
+  return slots;
 }
 
-async function findSlotsForOffice(page, office, minDate, maxDate) {
-  await selectBookingFlow(page, office);
-
-  const pageText = await page.locator("body").innerText().catch(() => "");
-  if (CONFIG.calendar.unavailableTextPatterns.some((pattern) => pattern.test(pageText))) {
-    console.log(`[${office}] Calendar reports no availability.`);
-  }
-
+async function scanWeeks(page, office, minDate, maxDate) {
   const found = [];
-  for (let calendarPage = 0; calendarPage < 3; calendarPage += 1) {
-    const slots = await readCandidateSlots(page, minDate, maxDate);
-    found.push(...slots);
+  for (let weekStep = 0; weekStep < 4; weekStep += 1) {
+    console.log(`[INFO] Scanning week ${weekStep + 1} for ${office.name}`);
+    const weekSlots = await extractSlotsFromCurrentWeek(page, office, minDate, maxDate);
+    found.push(...weekSlots);
 
-    if (found.length > 0) break;
-
-    // The search window is only 1-3 weeks out, but one next-page click helps if
-    // the current calendar is positioned at the end of a month.
-    const moved = await goToNextCalendarPage(page);
-    if (!moved) break;
+    if (weekStep < 3) {
+      const nextWeekButton = page.locator("button, [role='button']").filter({ hasText: /next|seuraava|vk/i }).first();
+      if (await nextWeekButton.count()) {
+        try {
+          await nextWeekButton.click({ force: true });
+          await page.waitForTimeout(3_000);
+        } catch {
+          console.log("[INFO] Week navigation button not available; stopping at current results page.");
+          break;
+        }
+      }
+    }
   }
 
-  const uniqueByDate = new Map();
-  for (const slot of found) {
-    if (!uniqueByDate.has(slot.dateIso)) uniqueByDate.set(slot.dateIso, slot);
-  }
-
-  return [...uniqueByDate.values()].sort((a, b) => a.dateIso.localeCompare(b.dateIso));
+  return found;
 }
 
 async function sendEmail({ office, slots }) {
   const { GMAIL_USER, GMAIL_APP_PASSWORD, ALERT_TO_EMAIL } = process.env;
 
   if (DRY_RUN) {
-    console.log(`[${office}] Dry run enabled. Would send an email with ${slots.length} slot(s).`);
+    console.log(`[DRY-RUN] Would send email for ${office} with ${slots.length} slot(s)`);
     return;
   }
 
   if (!GMAIL_USER || !GMAIL_APP_PASSWORD || !ALERT_TO_EMAIL) {
-    throw new Error(
-      "Missing email environment variables. Set GMAIL_USER, GMAIL_APP_PASSWORD, and ALERT_TO_EMAIL, or run with DRY_RUN=true.",
-    );
+    throw new Error("Missing email environment variables. Set GMAIL_USER, GMAIL_APP_PASSWORD, and ALERT_TO_EMAIL, or run with DRY_RUN=true.");
   }
 
   const transporter = nodemailer.createTransport({
     service: "gmail",
-    auth: {
-      user: GMAIL_USER,
-      pass: GMAIL_APP_PASSWORD,
-    },
+    auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
   });
 
-  const dates = slots.map((slot) => `- ${slot.dateIso}: ${slot.label}`).join("\n");
-
+  const message = slots.map((slot) => `- ${slot.office}: ${slot.date} ${slot.time} (${slot.source.trim()})`).join("\n");
   await transporter.sendMail({
-    from: `Migri appointment checker <${GMAIL_USER}>`,
+    from: `Migri checker <${GMAIL_USER}>`,
     to: ALERT_TO_EMAIL,
-    subject: `Migri appointment available: ${office}`,
+    subject: `Migri available slots for ${office}`,
     text: [
-      `An open Migri appointment slot was found for ${office}.`,
+      `Found ${slots.length} appointment slot(s) for ${office}:`,
+      message,
       "",
-      "Dates found:",
-      dates,
-      "",
-      `Booking page: ${CONFIG.bookingUrl}`,
-      "",
-      "This tool only checks availability and does not attempt to book an appointment.",
+      "This checker only reports availability and does not book anything.",
     ].join("\n"),
   });
 }
 
 async function main() {
   const today = startOfLocalDay();
-  const minDate = addDays(today, CONFIG.minDaysFromToday);
-  const maxDate = addDays(today, CONFIG.maxDaysFromToday);
+  const targetDate = addDays(today, 21);
+  const minDate = addDays(today, 7);
+  const maxDate = addDays(today, LOOKAHEAD_DAYS);
+  console.log(`[INFO] Checking appointments from ${formatDate(minDate)} to ${formatDate(maxDate)}`);
+  console.log(`[INFO] Alerting only for slots on ${formatDate(targetDate)} (3 weeks from today)`);
 
-  console.log(
-    `Checking Migri appointments from ${formatDate(minDate)} to ${formatDate(maxDate)}.`,
-  );
-
-  const browser = await chromium.launch({
-    headless: HEADLESS,
-    slowMo: SLOW_MO_MS,
-  });
-
+  const browser = await chromium.launch({ headless: HEADLESS, slowMo: SLOW_MO_MS });
   try {
-    const context = await browser.newContext({
-      locale: "en-GB",
-      timezoneId: "Europe/Helsinki",
-      viewport: { width: 1366, height: 900 },
-    });
+    const context = await browser.newContext({ locale: "en-GB", timezoneId: "Europe/Helsinki", viewport: { width: 1600, height: 1200 } });
     const page = await context.newPage();
 
-    for (const office of CONFIG.officesInPriorityOrder) {
-      console.log(`[${office}] Checking availability...`);
-      const slots = await findSlotsForOffice(page, office, minDate, maxDate);
-
-      if (slots.length > 0) {
-        console.log(`[${office}] Found ${slots.length} matching date(s). Sending email.`);
-        await sendEmail({ office, slots });
-        console.log(`[${office}] Email alert sent. Stopping priority search.`);
-        return;
+    const allSlots = [];
+    for (const office of CONFIG.targetOffices) {
+      try {
+        await selectBookingFlow(page, office);
+        const officeSlots = await scanWeeks(page, office, minDate, maxDate);
+        allSlots.push(...officeSlots);
+      } catch (error) {
+        console.log(`[WARN] Could not complete check for ${office.name}: ${error.message}`);
       }
-
-      console.log(`[${office}] No matching slots found.`);
     }
 
-    console.log("Check ran successfully. No matching appointment slots found; no email sent.");
+    const thresholdDate = startOfLocalDay(targetDate);
+    const matchingSlots = allSlots.filter((slot) => startOfLocalDay(new Date(slot.date)) <= thresholdDate);
+    if (matchingSlots.length > 0) {
+      console.log(`[INFO] Found ${matchingSlots.length} slot(s) within 3 weeks (${formatDate(targetDate)})`);
+      await sendEmail({ office: CONFIG.targetOffices.map((item) => item.name).join(", "), slots: matchingSlots });
+    } else if (allSlots.length > 0) {
+      console.log(`[INFO] Found ${allSlots.length} slot(s), but none are within 3 weeks (${formatDate(targetDate)})`);
+    } else {
+      console.log("[INFO] No matching slots found");
+    }
   } finally {
     await browser.close();
   }
