@@ -1,0 +1,15 @@
+{
+  "name": "migri-appointment-availability-checker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Automated appointment availability checker for the Finnish Immigration Service booking site.",
+  "type": "module",
+  "scripts": {
+    "check": "node src/check-migri.js",
+    "check:headed": "HEADLESS=false SLOW_MO_MS=250 node src/check-migri.js"
+  },
+  "dependencies": {
+    "nodemailer": "^9.0.3",
+    "playwright": "^1.49.1"
+  }
+}
