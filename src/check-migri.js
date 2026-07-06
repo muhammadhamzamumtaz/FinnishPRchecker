@@ -193,15 +193,21 @@ async function selectBookingFlow(page, office) {
 
   const searchButton = await waitForSearchButton(page);
   console.log(`[INFO] Searching appointments for ${office.name}`);
-  if (await searchButton.count()) {
-    await searchButton.click({ force: true });
-  } else {
-    await page.evaluate(() => {
-      const button = Array.from(document.querySelectorAll("button")).find((element) => /hae\s+vapaat\s+ajat|search/i.test(element.textContent || ""));
-      if (button) {
-        button.click();
-      }
+  const clicked = await page.evaluate(() => {
+    const buttons = Array.from(document.querySelectorAll("button")).filter((element) => /hae\s+vapaat\s+ajat|search/i.test(element.textContent || ""));
+    const visible = buttons.find((button) => {
+      const style = window.getComputedStyle(button);
+      return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0" && button.offsetWidth > 0 && button.offsetHeight > 0;
     });
+    if (visible) {
+      visible.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+      visible.click();
+      return true;
+    }
+    return false;
+  });
+  if (!clicked && await searchButton.count()) {
+    await searchButton.click({ force: true });
   }
   await page.waitForTimeout(4_000);
 }
